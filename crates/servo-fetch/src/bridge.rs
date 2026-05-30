@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
 
@@ -15,11 +15,12 @@ use servo::{
     ConsoleLogLevel, EventLoopWaker, JSValue, LoadStatus, NavigationRequest, Preferences, RenderingContext,
     ServoBuilder, SoftwareRenderingContext, UserContentManager, WebView, WebViewBuilder, WebViewDelegate, WebViewId,
 };
+use tokio::sync::mpsc;
 use url::Url;
 
 use crate::{layout, visibility};
 
-const JS_EVAL_TIMEOUT: Duration = Duration::from_secs(10);
+const EXTRACTION_BUDGET: Duration = Duration::from_secs(10);
 
 pub(crate) fn default_user_agent() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
@@ -31,8 +32,6 @@ pub(crate) fn default_user_agent() -> &'static str {
         crate::net::sanitize_user_agent(raw)
     })
 }
-/// Max wait before we re-check time-based conditions.
-pub(crate) const FALLBACK_WAIT: Duration = Duration::from_millis(5);
 const LAYOUT_JS: &str = include_str!("js/layout.js");
 const VISIBILITY_JS: &str = include_str!("js/visibility.js");
 const MAX_CONSOLE_MESSAGES: usize = 100;
@@ -264,13 +263,15 @@ pub(crate) enum FetchMode {
     ExecuteJs { expression: String },
 }
 
+type ReplyFn = Box<dyn FnOnce(Result<ServoPage>) + Send + 'static>;
+
 struct FetchRequest {
     url: String,
     timeout_secs: u64,
     settle_ms: u64,
     mode: FetchMode,
     user_agent: Option<String>,
-    reply: mpsc::Sender<Result<ServoPage>>,
+    reply: ReplyFn,
 }
 
 struct PendingFetch {
@@ -282,7 +283,7 @@ struct PendingFetch {
 }
 
 struct Engine {
-    requests: mpsc::SyncSender<FetchRequest>,
+    requests: mpsc::Sender<FetchRequest>,
     wake: Arc<WakeFlag>,
     policy: crate::net::NetworkPolicy,
 }
@@ -325,12 +326,11 @@ impl PageFetcher for ServoFetcher {
     }
 }
 
-pub(crate) fn fetch_page(opts: FetchOptions<'_>) -> Result<ServoPage> {
-    /// Max outstanding requests queued toward the engine.
-    const PENDING_CAPACITY: usize = 64;
+const PENDING_CAPACITY: usize = 64;
 
-    let engine = ENGINE.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel::<FetchRequest>(PENDING_CAPACITY);
+fn ensure_engine() -> &'static Engine {
+    ENGINE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<FetchRequest>(PENDING_CAPACITY);
         let wake = Arc::new(WakeFlag::default());
         let wake_for_thread = wake.clone();
         let policy = pending_policy();
@@ -343,32 +343,45 @@ pub(crate) fn fetch_page(opts: FetchOptions<'_>) -> Result<ServoPage> {
             wake,
             policy,
         }
-    });
+    })
+}
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-    let deadline =
-        Duration::from_secs(opts.timeout_secs) + Duration::from_millis(opts.settle_ms) + Duration::from_secs(2);
-    engine
-        .requests
-        .send(FetchRequest {
-            url: opts.url.to_string(),
-            timeout_secs: opts.timeout_secs,
-            settle_ms: opts.settle_ms,
-            mode: opts.mode,
-            user_agent: opts.user_agent.map(String::from),
-            reply: reply_tx,
-        })
-        .map_err(|_| anyhow!("Servo engine is not running (it may have crashed on a previous request)"))?;
-    // Nudge the engine so it checks the request queue even if it was idle.
-    engine.wake.signal();
-
-    match reply_rx.recv_timeout(deadline) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err(anyhow!("Servo engine did not respond within {}s", deadline.as_secs()))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("Servo engine crashed while processing this page")),
+fn build_request(opts: FetchOptions<'_>, reply: ReplyFn) -> FetchRequest {
+    FetchRequest {
+        url: opts.url.to_string(),
+        timeout_secs: opts.timeout_secs,
+        settle_ms: opts.settle_ms,
+        mode: opts.mode,
+        user_agent: opts.user_agent.map(String::from),
+        reply,
     }
+}
+
+fn extraction_deadline_for(page_deadline: Instant) -> Instant {
+    page_deadline.max(Instant::now() + EXTRACTION_BUDGET)
+}
+
+pub(crate) fn fetch_page(opts: FetchOptions<'_>) -> Result<ServoPage> {
+    let engine = ensure_engine();
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<ServoPage>>(1);
+    let request = build_request(
+        opts,
+        Box::new(move |r| {
+            let _ = reply_tx.send(r);
+        }),
+    );
+    engine.requests.try_send(request).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => {
+            anyhow!("Servo engine queue is full ({PENDING_CAPACITY} pending); back off and retry")
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            anyhow!("Servo engine is not running (it may have crashed on a previous request)")
+        }
+    })?;
+    engine.wake.signal();
+    reply_rx
+        .recv()
+        .unwrap_or_else(|_| Err(anyhow!("Servo engine crashed while processing this page")))
 }
 
 fn is_apple_gl_driver_noise(line: &str) -> bool {
@@ -379,14 +392,14 @@ fn is_apple_gl_driver_noise(line: &str) -> bool {
     clippy::needless_pass_by_value,
     reason = "the thread owns its receiver for its lifetime"
 )]
-fn servo_thread(request_rx: mpsc::Receiver<FetchRequest>, wake: Arc<WakeFlag>, policy: crate::net::NetworkPolicy) {
+fn servo_thread(mut request_rx: mpsc::Receiver<FetchRequest>, wake: Arc<WakeFlag>, policy: crate::net::NetworkPolicy) {
     let _filter = crate::sys::StderrFilter::install(is_apple_gl_driver_noise).ok();
 
     let (rc_ctx, servo) = match build_servo(FlagWaker(wake.clone())) {
         Ok(pair) => pair,
         Err(e) => {
-            if let Ok(req) = request_rx.recv() {
-                let _ = req.reply.send(Err(e.context("Servo initialization failed")));
+            if let Some(req) = request_rx.blocking_recv() {
+                (req.reply)(Err(e.context("Servo initialization failed")));
             }
             return;
         }
@@ -410,9 +423,9 @@ fn servo_thread(request_rx: mpsc::Receiver<FetchRequest>, wake: Arc<WakeFlag>, p
 
         if pending.is_empty() {
             // Idle: block until a new request nudges us or the channel hangs up.
-            match request_rx.recv() {
-                Ok(req) => accept_request(&servo, &rc_ctx, &delegate, &ucm, req, &mut pending),
-                Err(_) => return,
+            match request_rx.blocking_recv() {
+                Some(req) => accept_request(&servo, &rc_ctx, &delegate, &ucm, req, &mut pending),
+                None => return,
             }
             continue;
         }
@@ -423,7 +436,7 @@ fn servo_thread(request_rx: mpsc::Receiver<FetchRequest>, wake: Arc<WakeFlag>, p
         if !pending.is_empty() {
             // Wait for Servo to wake us or the next pending deadline, whichever is sooner.
             let now = Instant::now();
-            let next = pending
+            let next_deadline = pending
                 .values()
                 .map(|p| {
                     p.state
@@ -432,8 +445,8 @@ fn servo_thread(request_rx: mpsc::Receiver<FetchRequest>, wake: Arc<WakeFlag>, p
                         .map_or(p.deadline, |t| t + Duration::from_millis(p.request.settle_ms))
                 })
                 .min()
-                .map_or(FALLBACK_WAIT, |t| t.saturating_duration_since(now).min(FALLBACK_WAIT));
-            wake.wait_and_take(next);
+                .expect("pending is non-empty");
+            wake.wait_and_take(next_deadline.saturating_duration_since(now));
         }
     }
 }
@@ -451,7 +464,7 @@ fn accept_request(
             pending.insert(p.webview.id(), p);
         }
         Err((req, err)) => {
-            let _ = req.reply.send(Err(err));
+            (req.reply)(Err(err));
         }
     }
 }
@@ -475,7 +488,7 @@ fn harvest(servo: &servo::Servo, delegate: &Rc<SharedDelegate>, pending: &mut Ha
         let result = finish_fetch(servo, &p);
         delegate.remove(id);
         drop(p.webview);
-        let _ = p.request.reply.send(result);
+        (p.request.reply)(result);
     }
 }
 
@@ -550,23 +563,32 @@ fn finish_fetch(servo: &servo::Servo, p: &PendingFetch) -> Result<ServoPage> {
         let _ = ctx.make_current();
     }
 
-    wait_for_ready_state(servo, &p.webview, p.deadline);
+    let extraction_deadline = extraction_deadline_for(p.deadline);
 
-    let inner_text = eval_js(servo, &p.webview, "document.body.innerText").ok();
-    let layout_json = eval_js(servo, &p.webview, LAYOUT_JS).ok();
-    let visibility_json = eval_js(servo, &p.webview, VISIBILITY_JS).ok();
+    wait_for_ready_state(servo, &p.webview, extraction_deadline);
 
-    let html = match eval_js(servo, &p.webview, "document.documentElement.outerHTML") {
+    let inner_text = eval_js(servo, &p.webview, "document.body.innerText", extraction_deadline).ok();
+    let layout_json = eval_js(servo, &p.webview, LAYOUT_JS, extraction_deadline).ok();
+    let visibility_json = eval_js(servo, &p.webview, VISIBILITY_JS, extraction_deadline).ok();
+
+    let html = match eval_js(
+        servo,
+        &p.webview,
+        "document.documentElement.outerHTML",
+        extraction_deadline,
+    ) {
         Ok(h) if !h.is_empty() => h,
         other => other?,
     };
 
     let (screenshot, js_result) = match &p.request.mode {
         FetchMode::Screenshot { full_page } => (
-            crate::screenshot::capture(servo, &p.webview, *full_page, p.request.timeout_secs),
+            crate::screenshot::capture(servo, &p.webview, *full_page, extraction_deadline),
             None,
         ),
-        FetchMode::ExecuteJs { expression } => (None, Some(eval_js(servo, &p.webview, expression)?)),
+        FetchMode::ExecuteJs { expression } => {
+            (None, Some(eval_js(servo, &p.webview, expression, extraction_deadline)?))
+        }
         FetchMode::Content { .. } => (None, None),
     };
 
@@ -641,17 +663,24 @@ fn create_noise_removal_stylesheet() -> servo::user_contents::UserStyleSheet {
 /// fully parsed on pages with heavy inline scripts (e.g. amazon.co.jp); see
 /// servo/servo#41972.
 fn wait_for_ready_state(servo: &servo::Servo, webview: &WebView, deadline: Instant) {
-    while Instant::now() < deadline {
+    loop {
         servo.spin_event_loop();
-        if matches!(eval_js(servo, webview, "document.readyState"), Ok(s) if s == "complete") {
+        if matches!(eval_js(servo, webview, "document.readyState", deadline), Ok(s) if s == "complete") {
             return;
         }
-        wait_for_wake(FALLBACK_WAIT);
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::warn!("document did not finish loading; content may be incomplete");
+            return;
+        }
+        wait_for_wake(deadline.saturating_duration_since(now));
     }
-    tracing::warn!("document did not finish loading; content may be incomplete");
 }
 
-pub(crate) fn eval_js(servo: &servo::Servo, webview: &WebView, script: &str) -> Result<String> {
+pub(crate) fn eval_js(servo: &servo::Servo, webview: &WebView, script: &str, deadline: Instant) -> Result<String> {
+    if Instant::now() >= deadline {
+        return Err(anyhow!("timeout waiting for JS evaluation"));
+    }
     let result: Rc<RefCell<Option<Result<String>>>> = Rc::new(RefCell::new(None));
     let cb_result = result.clone();
 
@@ -667,16 +696,16 @@ pub(crate) fn eval_js(servo: &servo::Servo, webview: &WebView, script: &str) -> 
         *cb_result.borrow_mut() = Some(val);
     });
 
-    let deadline = Instant::now() + JS_EVAL_TIMEOUT;
     loop {
         servo.spin_event_loop();
         if let Some(val) = result.borrow_mut().take() {
             return val;
         }
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(anyhow!("timeout waiting for JS evaluation"));
         }
-        wait_for_wake(FALLBACK_WAIT);
+        wait_for_wake(deadline.saturating_duration_since(now));
     }
 }
 
@@ -713,6 +742,8 @@ fn jsvalue_to_json(val: &JSValue) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
+
     use super::*;
 
     #[test]
@@ -875,5 +906,100 @@ mod tests {
             state.console_messages.borrow().is_empty(),
             "console_messages should be empty"
         );
+    }
+
+    fn closure_test_request(reply: ReplyFn) -> FetchRequest {
+        FetchRequest {
+            url: "test://".into(),
+            timeout_secs: 1,
+            settle_ms: 0,
+            mode: FetchMode::Content { include_a11y: false },
+            user_agent: None,
+            reply,
+        }
+    }
+
+    #[test]
+    fn build_request_preserves_fields() {
+        let opts = FetchOptions {
+            url: "test://example",
+            timeout_secs: 5,
+            settle_ms: 100,
+            mode: FetchMode::Content { include_a11y: false },
+            user_agent: Some("test-ua"),
+        };
+        let req = build_request(opts, Box::new(|_| {}));
+        assert_eq!(req.url, "test://example");
+        assert_eq!(req.timeout_secs, 5);
+        assert_eq!(req.settle_ms, 100);
+        assert_eq!(req.user_agent.as_deref(), Some("test-ua"));
+        assert!(matches!(req.mode, FetchMode::Content { include_a11y: false }));
+    }
+
+    #[test]
+    fn extraction_deadline_floors_at_budget_when_page_deadline_passed() {
+        let result = extraction_deadline_for(Instant::now());
+        let remaining = result.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_millis(9_500) && remaining <= EXTRACTION_BUDGET,
+            "remaining outside expected window: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn extraction_deadline_uses_page_deadline_when_far_future() {
+        let future = Instant::now() + Duration::from_secs(60);
+        let result = extraction_deadline_for(future);
+        assert_eq!(result, future);
+    }
+
+    #[test]
+    fn closure_reply_delivers_via_std_mpsc() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ServoPage>>(1);
+        let req = closure_test_request(Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        (req.reply)(Ok(ServoPage::default()));
+        let Ok(Ok(page)) = rx.recv_timeout(Duration::from_millis(50)) else {
+            panic!("expected Ok delivery");
+        };
+        assert!(page.html.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closure_reply_delivers_via_oneshot() {
+        let (tx, rx) = oneshot::channel::<Result<ServoPage>>();
+        let req = closure_test_request(Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        (req.reply)(Err(anyhow!("test failure")));
+        let Ok(Err(err)) = rx.await else {
+            panic!("expected Err delivery");
+        };
+        assert!(err.to_string().contains("test failure"));
+    }
+
+    #[test]
+    fn closure_drop_disconnects_std_mpsc_receiver() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ServoPage>>(1);
+        let req = closure_test_request(Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        drop(req); // simulate engine dropping the request before invoking reply
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(_) => panic!("expected disconnect"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(other) => panic!("expected Disconnected, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closure_drop_disconnects_oneshot_receiver() {
+        let (tx, rx) = oneshot::channel::<Result<ServoPage>>();
+        let req = closure_test_request(Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        drop(req);
+        assert!(rx.await.is_err());
     }
 }
