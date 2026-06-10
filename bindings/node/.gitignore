@@ -1,0 +1,9 @@
+node_modules/
+dist/
+package-lock.json
+*.tgz
+npm/*/servo-fetch
+npm/*/servo-fetch.exe
+npm/*/*.dll
+npm/*/LICENSE-MIT
+npm/*/LICENSE-APACHE
